@@ -194,6 +194,11 @@ button.chip:hover, a.chip:hover { border-color: var(--brand); }
 .gate-card h2 { margin: 0; font-family: var(--f-display); font-size: 1.25rem; }
 .gate-card p { margin: 0; line-height: 1.8; }
 .gate-card .err { color: var(--bad); min-height: 1.4em; }
+.okbox { background: var(--ok-soft); color: var(--ink); border-radius: 10px; padding: 12px 14px; font-size: .9rem; line-height: 1.8; }
+.okbox ul { padding-inline-start: 18px; }
+.bad-t { color: var(--bad); } .warn-t { color: var(--warn); }
+.banner .btn { margin-inline-start: auto; flex-shrink: 0; }
+#gate input[type="text"] { width: 100%; }
 
 </style>
 <script src="config.js"></script>
@@ -574,14 +579,134 @@ const ArchiveLogic = (() => {
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLogic;
 
+/* مزامنة الأرشيف عبر ملفات JSON — دوال نقية (تُختبر بـ node).
+   ملف البيانات (archive-data.json) هو المرجع؛ إضافات كل معلم تُصدَّر في ملف صغير؛ المدير يدمجها. */
+const ArchiveSync = (() => {
+  const FORMAT_DATA = 'school-archive-data', FORMAT_ADD = 'school-archive-additions', VERSION = 1;
+  const norm = u => (typeof ArchiveLogic !== 'undefined' ? ArchiveLogic : require('./logic')).normalizeUrl(u);
+  const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
+  const strArr = (v, max) => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 40).slice(0, max) : []);
+  const ID_RE = /^[\w؀-ۿ-]{1,64}$/;
+  const ts = d => (d && typeof d._ts === 'string' ? d._ts : '');
+
+  /* ينقّي سجلاً قادماً من ملف خارجي: حقول معروفة فقط بأنواع صحيحة. يعيد null إن كان غير صالح. */
+  function sanitizeDoc(raw) {
+    if (!raw || typeof raw !== 'object' || !ID_RE.test(String(raw.id || ''))) return null;
+    if (raw._purged === true) return { id: raw.id, _purged: true, _ts: str(raw._ts, 40) };
+    const url = norm(raw.url);
+    const title = str(raw.title, 300).trim();
+    if (!url || !title) return null;
+    const d = {
+      id: raw.id, title, url, note: str(raw.note, 2000),
+      year: str(String(raw.year == null ? '' : raw.year), 8),
+      activityIds: strArr(raw.activityIds, 60), registerIds: strArr(raw.registerIds, 60),
+      createdBy: str(raw.createdBy, 80) || null, createdAt: str(raw.createdAt, 40),
+      updatedAt: str(raw.updatedAt, 40), updatedBy: str(raw.updatedBy, 80) || null,
+      deleted: raw.deleted === true, _ts: str(raw._ts, 40),
+    };
+    if (d.deleted) { d.deletedBy = str(raw.deletedBy, 80) || null; d.deletedAt = str(raw.deletedAt, 40); }
+    return d;
+  }
+
+  function emptyData() { return { format: FORMAT_DATA, version: VERSION, updatedAt: '', evidence: [], meta: {}, people: {} }; }
+
+  /* يقرأ ملف البيانات؛ يعيد بيانات فارغة إن لم يوجد، ويرمي خطأ إن كان تالفاً. */
+  function parseData(text) {
+    if (text == null || text === '') return emptyData();
+    const j = JSON.parse(text);
+    if (!j || j.format !== FORMAT_DATA) throw new Error('ليس ملف بيانات أرشيف');
+    const out = emptyData();
+    out.updatedAt = str(j.updatedAt, 40);
+    out.evidence = (Array.isArray(j.evidence) ? j.evidence : []).map(sanitizeDoc).filter(d => d && !d._purged);
+    out.meta = j.meta && typeof j.meta === 'object' ? j.meta : {};
+    out.people = cleanPeople(j.people);
+    return out;
+  }
+  function cleanPeople(p) {
+    const out = {};
+    if (p && typeof p === 'object') for (const [k, v] of Object.entries(p)) if (ID_RE.test(k) && typeof v === 'string') out[k] = v.slice(0, 80);
+    return out;
+  }
+
+  /* يطبّق التعديلات المحلية فوق المرجع: المحلي يغلب، وعلامة الحذف النهائي تُخفي السجل. */
+  function applyLocal(baseDocs, localDocs) {
+    const m = new Map(baseDocs.map(d => [d.id, d]));
+    for (const d of localDocs) { if (d._purged) m.delete(d.id); else m.set(d.id, d); }
+    return [...m.values()];
+  }
+
+  /* يحذف من المحلي ما وصل إلى المرجع (بنفس الوقت أو أحدث). */
+  function pruneLocal(baseDocs, localDocs) {
+    const b = new Map(baseDocs.map(d => [d.id, d]));
+    return localDocs.filter(d => {
+      const x = b.get(d.id);
+      if (d._purged) return !!x;            // الحذف النهائي ينتهي حين يختفي السجل من المرجع
+      return !x || ts(x) < ts(d);
+    });
+  }
+
+  function makeAdditions(localDocs, by, now) {
+    return { format: FORMAT_ADD, version: VERSION, exportedAt: now, by: { id: by.id, name: by.name }, evidence: localDocs.filter(d => !d._purged) };
+  }
+
+  /* الدمج: المرجع + ملفات المعلمين + تعديلات المدير المحلية → ملف بيانات جديد وتقرير. */
+  function merge(base, inputs, admin, now) {
+    const map = new Map(base.evidence.map(d => [d.id, d]));
+    const people = { ...base.people };
+    const report = { files: [], added: 0, updated: 0, older: 0, duplicates: 0, invalid: 0, purged: 0 };
+    const urlOwner = () => { const u = new Map(); for (const d of map.values()) if (!d.deleted) u.set(d.url, d.id); return u; };
+    function take(docs, trusted, r) {
+      for (const raw of docs) {
+        const d = sanitizeDoc(raw);
+        if (!d) { r.invalid++; continue; }
+        if (d._purged) { if (trusted && map.has(d.id)) { map.delete(d.id); r.purged++; } continue; }
+        const cur = map.get(d.id);
+        if (cur) {
+          if (ts(d) > ts(cur)) { map.set(d.id, d); r.updated++; } else r.older++;
+          continue;
+        }
+        const owner = urlOwner().get(d.url);
+        if (owner && !d.deleted) { r.duplicates++; r.dupTitles.push(d.title); continue; }
+        map.set(d.id, d); r.added++;
+      }
+    }
+    for (const f of inputs) {
+      const r = { name: f.name, by: '', added: 0, updated: 0, older: 0, duplicates: 0, invalid: 0, purged: 0, dupTitles: [], error: '' };
+      let j = null;
+      try { j = JSON.parse(f.text); } catch (e) { r.error = 'الملف ليس JSON صالحاً'; }
+      if (j && j.format !== FORMAT_ADD && j.format !== FORMAT_DATA) { r.error = 'ليس ملف إضافات من الأرشيف'; j = null; }
+      if (j) {
+        if (j.by && typeof j.by.id === 'string' && ID_RE.test(j.by.id)) { r.by = str(j.by.name, 80); if (r.by) people[j.by.id] = r.by; }
+        Object.assign(people, cleanPeople(j.people));
+        take(Array.isArray(j.evidence) ? j.evidence : [], false, r);
+      }
+      report.files.push(r);
+    }
+    if (admin) {
+      const r = { name: 'تعديلاتك في هذا المتصفح', by: admin.by ? admin.by.name : '', added: 0, updated: 0, older: 0, duplicates: 0, invalid: 0, purged: 0, dupTitles: [], error: '' };
+      if (admin.by && admin.by.id) people[admin.by.id] = admin.by.name;
+      take(admin.evidence || [], true, r);
+      report.files.push(r);
+    }
+    for (const r of report.files) for (const k of ['added', 'updated', 'older', 'duplicates', 'invalid', 'purged']) report[k] += r[k];
+    const meta = { ...base.meta };
+    for (const [k, v] of Object.entries((admin && admin.meta) || {})) if (['custom', 'state', 'backup'].includes(k) && v && typeof v === 'object') meta[k] = v;
+    const evidence = [...map.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '') || a.id.localeCompare(b.id));
+    return { data: { format: FORMAT_DATA, version: VERSION, updatedAt: now, evidence, meta, people }, report };
+  }
+
+  return { FORMAT_DATA, FORMAT_ADD, sanitizeDoc, parseData, emptyData, applyLocal, pruneLocal, makeAdditions, merge };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveSync;
+
 /* منصة التشغيل المستقلة (GitHub Pages): تقدّم واجهة db / user / downloads
-   فوق تخزين المتصفح المحلي، أو فوق Firebase إذا وُجدت إعداداته في config.js. */
+   فوق ملف archive-data.json مع تعديلات المتصفح المحلية (افتراضي)، أو فوق Firebase إذا وُجدت إعداداته في config.js. */
 (() => {
   'use strict';
   const CFG = window.ARCHIVE_CONFIG || {};
   const FB = CFG.firebase && CFG.firebase.apiKey && CFG.firebase.projectId ? CFG.firebase : null;
   const SDK = CFG.sdkVersion || '10.12.2';
-  const kind = FB ? 'firebase' : 'local';
+  const kind = FB ? 'firebase' : 'static';
   const P = (window.ARCHIVE_PLATFORM = { kind });
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -596,41 +721,123 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
     },
   };
 
-  /* ---------- وضع محلي: قاعدة بيانات تُحفظ في localStorage ---------- */
-  const KEY = 'archive-local-db-v1';
-  const rid = () => 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  function localDb() {
-    let store = new Map();
-    try { store = new Map(Object.entries(JSON.parse(localStorage.getItem(KEY) || '{}'))); } catch (e) { store = new Map(); }
-    const subs = [];
-    const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(Object.fromEntries(store))); } catch (e) { throw { code: 'quota_exceeded' }; } };
-    const snapOf = path => ({ id: path.split('/').pop(), exists: store.has(path), data: () => store.get(path) });
-    const colDocs = col => [...store.keys()].filter(p => p.startsWith(col + '/') && p.split('/').length === col.split('/').length + 1).sort();
-    const fire = () => subs.slice().forEach(s => {
-      if (s.kind === 'doc') s.fn(snapOf(s.path));
-      else { const docs = colDocs(s.path).map(snapOf); s.fn({ docs, size: docs.length, empty: !docs.length }); }
-    });
-    const clone = d => JSON.parse(JSON.stringify(d));
-    const docRef = path => ({
-      id: path.split('/').pop(), path,
-      get: async () => snapOf(path),
-      set: async d => { store.set(path, clone(d)); persist(); fire(); },
-      update: async d => { if (!store.has(path)) throw { code: 'invalid_argument', message: 'missing' }; store.set(path, { ...store.get(path), ...clone(d) }); persist(); fire(); },
-      delete: async () => { store.delete(path); persist(); fire(); },
-      onSnapshot: fn => { const s = { kind: 'doc', path, fn }; subs.push(s); setTimeout(() => fn(snapOf(path)), 0); return () => subs.splice(subs.indexOf(s), 1); },
-    });
-    const colRef = col => ({
-      doc: id => docRef(col + '/' + (id || rid())),
-      add: async d => { const r = docRef(col + '/' + rid()); await r.set(d); return r; },
-      onSnapshot: fn => { const s = { kind: 'col', path: col, fn }; subs.push(s); setTimeout(() => { const docs = colDocs(col).map(snapOf); fn({ docs, size: docs.length, empty: !docs.length }); }, 0); return () => subs.splice(subs.indexOf(s), 1); },
-    });
-    return { doc: docRef, collection: colRef };
+  /* ---------- وضع الملفات (افتراضي): المرجع archive-data.json + تعديلات هذا المتصفح ---------- */
+  const SY = ArchiveSync;
+  const LKEY = 'archive-local-v2', MEKEY = 'archive-me', ADMKEY = 'archive-admin';
+  const rid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const nowIso = () => new Date().toISOString();
+  const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } };
+  try { if (/[?&#]admin\b/.test(location.search + location.hash)) localStorage.setItem(ADMKEY, '1'); } catch (e) { }
+  const isAdmin = () => { try { return localStorage.getItem(ADMKEY) === '1'; } catch (e) { return false; } };
+
+  let baseData = SY.emptyData(), loadError = '';
+  const base = new Map();   // path -> data
+  let local = { docs: {}, lastExport: '' };
+  const subs = [];
+
+  async function loadBase() {
+    const url = (CFG.dataUrl || 'archive-data.json') + '?t=' + Date.now();
+    let text = '';
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (r.ok) text = await r.text(); else if (r.status !== 404) loadError = 'تعذّر تحميل ملف البيانات (' + r.status + ').';
+    } catch (e) { /* لا ملف بيانات (أو فتح الصفحة من الجهاز مباشرة) */ }
+    try { baseData = SY.parseData(text); } catch (e) { baseData = SY.emptyData(); loadError = 'ملف البيانات archive-data.json تالف؛ يُعرض الأرشيف بدونه.'; }
+    base.clear();
+    for (const d of baseData.evidence) base.set('evidence/' + d.id, d);
+    for (const [k, v] of Object.entries(baseData.meta)) if (v && typeof v === 'object') base.set('meta/' + k, v);
+    // تعديلات هذا المتصفح، بعد إسقاط ما وصل منها إلى المرجع
+    local = lsGet(LKEY, null) || { docs: {}, lastExport: '' };
+    if (!local.docs || typeof local.docs !== 'object') local.docs = {};
+    const ev = Object.entries(local.docs).filter(([p]) => p.startsWith('evidence/')).map(([p, d]) => ({ ...d, id: p.slice(9) }));
+    const keep = new Set(SY.pruneLocal(baseData.evidence, ev).map(d => 'evidence/' + d.id));
+    for (const p of Object.keys(local.docs)) {
+      if (p.startsWith('evidence/') && !keep.has(p)) delete local.docs[p];
+      else if (p.startsWith('meta/') && base.has(p) && String(base.get(p)._ts || '') >= String(local.docs[p]._ts || '')) delete local.docs[p];
+    }
+    lsSet(LKEY, local);
   }
-  const localUser = {
-    me: async () => ({ id: 'local', name: 'هذا المتصفح', canEdit: true, isOwner: true }),
-    can: async () => true,
-    profiles: async ids => Object.fromEntries(ids.map(i => [i, { name: 'هذا المتصفح' }])),
+  const view = p => { if (p in local.docs) return local.docs[p]._purged ? undefined : local.docs[p]; return base.get(p); };
+  const persist = () => { if (!lsSet(LKEY, local)) throw { code: 'quota_exceeded' }; };
+  const snapOf = p => { const d = view(p); return { id: p.split('/').pop(), exists: d !== undefined, data: () => d }; };
+  const colDocs = col => [...new Set([...base.keys(), ...Object.keys(local.docs)])]
+    .filter(p => p.startsWith(col + '/') && p.split('/').length === 2 && view(p) !== undefined).sort();
+  const fire = () => subs.slice().forEach(s => {
+    if (s.kind === 'doc') s.fn(snapOf(s.path));
+    else { const docs = colDocs(s.path).map(snapOf); s.fn({ docs, size: docs.length, empty: !docs.length }); }
+  });
+  const clone = d => JSON.parse(JSON.stringify(d));
+  const docRef = p => ({
+    id: p.split('/').pop(), path: p,
+    get: async () => snapOf(p),
+    set: async d => { local.docs[p] = { ...clone(d), _ts: nowIso() }; persist(); fire(); },
+    update: async d => { const cur = view(p); if (!cur) throw { code: 'invalid_argument', message: 'missing' }; local.docs[p] = { ...cur, ...clone(d), _ts: nowIso() }; persist(); fire(); },
+    delete: async () => { if (base.has(p)) local.docs[p] = { _purged: true, _ts: nowIso() }; else delete local.docs[p]; persist(); fire(); },
+    onSnapshot: fn => { const s = { kind: 'doc', path: p, fn }; subs.push(s); setTimeout(() => fn(snapOf(p)), 0); return () => subs.splice(subs.indexOf(s), 1); },
+  });
+  const staticDb = {
+    doc: docRef,
+    collection: col => ({
+      doc: id => docRef(col + '/' + (id || 'e' + rid())),
+      add: async d => { const r = docRef(col + '/e' + rid()); await r.set(d); return r; },
+      onSnapshot: fn => { const s = { kind: 'col', path: col, fn }; subs.push(s); setTimeout(() => { const docs = colDocs(col).map(snapOf); fn({ docs, size: docs.length, empty: !docs.length }); }, 0); return () => subs.splice(subs.indexOf(s), 1); },
+    }),
   };
+  const localEvidence = () => Object.entries(local.docs).filter(([p]) => p.startsWith('evidence/')).map(([p, d]) => ({ ...d, id: p.slice(9) }));
+
+  function askName() {
+    return new Promise(resolve => {
+      const el = gate(`<h2>الأرشيف الرقمي للمدرسة</h2><p>اكتب اسمك كما تريد أن يظهر بجانب الأدلة التي تضيفها.</p>
+        <form id="gName" style="display:grid;gap:10px"><label class="sr" for="gNameIn">اسمك</label><input id="gNameIn" type="text" maxlength="60" autocomplete="name" placeholder="مثال: أ. أحمد الشهري">
+        <button class="btn primary" type="submit">متابعة</button></form><p class="err" id="gErr" role="alert"></p>`);
+      const inp = el.querySelector('#gNameIn'); setTimeout(() => inp.focus(), 50);
+      el.querySelector('#gName').addEventListener('submit', ev => {
+        ev.preventDefault();
+        const name = inp.value.trim().replace(/\s+/g, ' ');
+        if (name.length < 2) { el.querySelector('#gErr').textContent = 'اكتب اسمك (حرفان على الأقل).'; return; }
+        const me = { id: 't' + rid(), name };
+        lsSet(MEKEY, me); hideGate(); resolve(me);
+      });
+    });
+  }
+  let staticReady = null, me = null;
+  function startStatic() {
+    if (staticReady) return staticReady;
+    staticReady = (async () => {
+      await loadBase();
+      me = lsGet(MEKEY, null);
+      if (!me || typeof me.id !== 'string' || typeof me.name !== 'string' || !me.name) me = await askName();
+      return true;
+    })();
+    return staticReady;
+  }
+  const staticUser = {
+    me: async () => ({ id: me.id, name: me.name, canEdit: isAdmin(), isOwner: false }),
+    can: async () => true,
+    profiles: async ids => Object.fromEntries(ids.map(i => [i, { name: i === me.id ? me.name : (baseData.people[i] || '') }])),
+  };
+  const fileDate = () => nowIso().slice(0, 10);
+  if (kind === 'static') {
+    P.status = () => ({ pending: localEvidence().length, lastExport: local.lastExport || '', loadError, admin: isAdmin(), dataUpdatedAt: baseData.updatedAt || '', name: me ? me.name : '' });
+    P.exportMine = async () => {
+      const docs = localEvidence().filter(d => !d._purged);
+      if (!docs.length) return 0;
+      const payload = SY.makeAdditions(docs, me, nowIso());
+      await downloads.save({ filename: `archive-additions-${fileDate()}-${me.id.slice(-5)}.json`, data: JSON.stringify(payload, null, 1) });
+      local.lastExport = nowIso(); lsSet(LKEY, local); fire();
+      return docs.length;
+    };
+    P.merge = async files => {
+      const inputs = [];
+      for (const f of files) inputs.push({ name: f.name, text: await f.text() });
+      const meta = {};
+      for (const [p, d] of Object.entries(local.docs)) if (p.startsWith('meta/') && !d._purged) meta[p.slice(5)] = d;
+      const res = SY.merge(baseData, inputs, { by: me, evidence: localEvidence(), meta }, nowIso());
+      await downloads.save({ filename: 'archive-data.json', data: JSON.stringify(res.data, null, 1) });
+      return res.report;
+    };
+  }
 
   /* ---------- Firebase ---------- */
   const loadScript = src => new Promise((res, rej) => {
@@ -694,12 +901,12 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
   if (kind === 'firebase') gate('<p>جارٍ التحميل…</p>');   // تغطية فورية قبل أي عرض للبيانات
   if (kind === 'firebase') P.signOut = () => { if (auth) auth.signOut().then(() => location.reload()); };
 
-  let localInst = null;
   P.use = async name => {
     if (name === 'downloads') return downloads;
-    if (kind === 'local') {
-      if (name === 'db') return localInst || (localInst = localDb());
-      if (name === 'user') return localUser;
+    if (kind === 'static') {
+      await startStatic();
+      if (name === 'db') return staticDb;
+      if (name === 'user') return staticUser;
       return null;
     }
     const c = await startFirebase();
@@ -900,7 +1107,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
     const demo = S.mode === 'demo' ? `<div class="banner" role="note">${ic('alert')}<span>وضع المعاينة: هذه بيانات تجريبية لا تُحفظ. تُحفظ البيانات الحقيقية عند فتح الأرشيف من حسابك.</span></div>` : '';
     const ro = S.mode === 'live' && !S.perm.write ? `<div class="banner" role="note">${ic('alert')}<span>لديك صلاحية عرض فقط. لإضافة ملفات اطلب صلاحية «مساهم» من مالك الأرشيف.</span></div>` : '';
     const plat = window.ARCHIVE_PLATFORM || null;
-    const loc = plat && plat.kind === 'local' ? `<div class="banner" role="note">${ic('alert')}<span>وضع التجربة المحلي: ما تضيفه يُحفظ في هذا المتصفح فقط ولا يراه الآخرون. لربط الأرشيف بقاعدة بيانات مشتركة اتبع ملف README.</span></div>` : '';
+    const st = plat && plat.status ? plat.status() : null;
+    let loc = '';
+    if (st) {
+      if (st.loadError) loc += `<div class="banner" role="alert">${ic('alert')}<span>${esc(st.loadError)}</span></div>`;
+      if (st.pending && !st.admin) loc += `<div class="banner" role="note">${ic('alert')}<span>لديك ${nf.format(st.pending)} ${st.pending === 1 ? 'إضافة أو تعديل' : 'إضافات وتعديلات'} لم تصل بعد إلى ملف الأرشيف${st.lastExport ? ` (آخر تصدير: ${esc(fmtDate(st.lastExport))})` : ''}. اضغط «تصدير إضافاتي» وأرسل الملف لمسؤول الأرشيف.</span><button class="btn sm" type="button" data-do="export-mine">${ic('down')}تصدير إضافاتي</button></div>`;
+      if (st.pending && st.admin) loc += `<div class="banner" role="note">${ic('alert')}<span>لديك ${nf.format(st.pending)} تعديل في هذا المتصفح لم يُنشر بعد. سيُضمَّن عند الدمج في صفحة الإدارة.</span></div>`;
+    }
     const out = plat && typeof plat.signOut === 'function' ? `<button class="btn sm" type="button" data-do="signout">خروج</button>` : '';
     const err = S.error ? `<div class="banner" role="alert">${ic('alert')}<span>${esc(S.error)}</span></div>` : '';
     const dark = document.documentElement.getAttribute('data-theme') === 'dark' || (!document.documentElement.getAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
@@ -1175,8 +1388,16 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
         <label class="toggle"><input type="checkbox" data-reg-hide="${esc(r.id)}"${r.hidden ? ' checked' : ''}> مخفي</label></div>`).join('') : '<div class="hint">لا سجلات.</div>'}</div>`;
     }).join('');
     const nextId = 'ن' + String(Math.max(...m.activities.map(a => parseInt(a.id.slice(1), 10) || 0)) + 1).padStart(2, '0');
-    return `
-      <section class="card pad"><h2>إغلاق العام الدراسي ${esc(cur)}هـ</h2>
+    const plat = window.ARCHIVE_PLATFORM || null;
+    const st = plat && plat.status ? plat.status() : null;
+    const mergeSec = plat && plat.merge ? `
+      <section class="card pad sec-merge"><h2>دمج إضافات المعلمين</h2>
+        <p class="hint" style="margin-top:0">${st && st.dataUpdatedAt ? `آخر تحديث لملف الأرشيف: ${esc(fmtDate(st.dataUpdatedAt))}. ` : 'لا يوجد ملف أرشيف منشور بعد. '}اختر ملفات JSON التي أرسلها المعلمون (يمكن اختيار عدة ملفات معاً)، ثم ارفع الملف الناتج <b class="ltr">archive-data.json</b> إلى GitHub مكان القديم. تعديلاتك في هذا المتصفح تُضمَّن تلقائياً.</p>
+        <div class="field"><label for="mergeFiles">ملفات المعلمين</label><input id="mergeFiles" type="file" accept=".json,application/json" multiple></div>
+        <button class="btn primary" type="button" data-do="merge">${ic('down')}دمج وتنزيل archive-data.json</button>
+        <div id="mergeReport" aria-live="polite"></div></section>` : '';
+    return `${mergeSec}
+      <section class="${mergeSec ? 'sec ' : ''}card pad"><h2>إغلاق العام الدراسي ${esc(cur)}هـ</h2>
         <div class="steps">
           <div class="step"><span class="num">1</span><div><b>نزّل جدول العام</b><div class="hint">كل ملفات ${esc(S.viewYear)}هـ بأسماء الأنشطة والمؤشرات والسجلات، يفتح في Excel.</div><div style="margin-top:8px"><button class="btn sm" type="button" data-do="export-csv">${ic('down')}تنزيل CSV</button></div></div></div>
           <div class="step"><span class="num">2</span><div><b>نزّل النسخة الكاملة</b><div class="hint">كل الأعوام مع تخصيصاتكم. احفظها على قرص خارجي أو في حساب المدرسة، وسلّمها للإدارة عند الانتقال.</div><div style="margin-top:8px"><button class="btn sm" type="button" data-do="export-json">${ic('down')}تنزيل JSON</button></div></div></div>
@@ -1300,6 +1521,24 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
       toast(`حُفظت نسخة كاملة (${nf.format(S.files.length)} ملف)`); if (S.tab === 'adm') refresh();
     }
   }
+  async function exportMine() {
+    const p = window.ARCHIVE_PLATFORM;
+    if (!p || !p.exportMine) return;
+    try { const n = await p.exportMine(); toast(n ? `نُزّل ملف إضافاتك (${nf.format(n)}). أرسله لمسؤول الأرشيف.` : 'لا توجد إضافات لتصديرها.'); renderTop(); }
+    catch (e) { toast('لم يكتمل التصدير.'); }
+  }
+  async function runMerge() {
+    const p = window.ARCHIVE_PLATFORM, inp = $('#mergeFiles'), out = $('#mergeReport');
+    if (!p || !p.merge || !out) return;
+    const files = inp && inp.files ? [...inp.files] : [];
+    out.innerHTML = '<p class="muted">جارٍ الدمج…</p>';
+    let r;
+    try { r = await p.merge(files); } catch (e) { out.innerHTML = '<div class="warnbox" role="alert">تعذّر الدمج. تأكد أن الملفات من الأرشيف ثم أعد المحاولة.</div>'; return; }
+    const row = f => `<li><b>${esc(f.name)}</b>${f.by ? ` — ${esc(f.by)}` : ''}: ${f.error ? `<span class="bad-t">${esc(f.error)}</span>` : `أُضيف ${f.added}، حُدّث ${f.updated}${f.purged ? `، حُذف نهائياً ${f.purged}` : ''}${f.duplicates ? `، <span class="warn-t">مكرر تُخطّي ${f.duplicates}</span>` : ''}${f.older ? `، أقدم من الموجود ${f.older}` : ''}${f.invalid ? `، <span class="bad-t">غير صالح ${f.invalid}</span>` : ''}`}${f.dupTitles && f.dupTitles.length ? `<div class="hint">المكرر: ${f.dupTitles.map(esc).join('، ')}</div>` : ''}</li>`;
+    out.innerHTML = `<div class="okbox" role="status" style="margin-top:12px"><b>نُزّل archive-data.json</b> — أُضيف ${r.added}، حُدّث ${r.updated}${r.duplicates ? `، مكرر ${r.duplicates}` : ''}${r.purged ? `، حُذف نهائياً ${r.purged}` : ''}.
+      <ul style="margin:8px 0 0">${r.files.map(row).join('')}</ul>
+      <p class="hint" style="margin-bottom:0">الخطوة التالية: في GitHub افتح المستودع ← Add file ← Upload files، وارفع هذا الملف (سيحل محل القديم) ثم Commit. يظهر التحديث للجميع خلال دقائق.</p></div>`;
+  }
   async function newYear() {
     const cur = S.meta.year, nextY = String(Number(cur) + 1);
     const closed = [...new Set([...(S.meta.closed || []), cur])];
@@ -1320,6 +1559,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = ArchiveLog
       const a = t.dataset.do, v = t.dataset.v, id = t.dataset.id;
       if (a === 'overlay') { if (ev.target === t) closeForm(); return; }
       switch (a) {
+        case 'export-mine': exportMine(); break;
+        case 'merge': runMerge(); break;
         case 'signout': { const p = window.ARCHIVE_PLATFORM; if (p && p.signOut) p.signOut(); break; }
         case 'theme': { const cur = document.documentElement.getAttribute('data-theme'); const dark = cur === 'dark' || (!cur && matchMedia('(prefers-color-scheme: dark)').matches); const nx = dark ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', nx); try { localStorage.setItem('arch-theme', nx); } catch (e) { } renderTop(); break; }
         case 'add': openForm(null); break;
