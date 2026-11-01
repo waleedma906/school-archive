@@ -1,7 +1,7 @@
 {
  "format": "school-archive-data",
  "version": 1,
- "updatedAt": "2026-11-01T12:35:11.923Z",
+ "updatedAt": "2026-11-01T14:40:14.237Z",
  "evidence": [
   {
    "id": "emvxt621qd9ryc",
@@ -20,8 +20,10 @@
    "createdAt": "2026-11-01T12:30:37.790Z",
    "updatedAt": "2026-11-01T12:30:37.790Z",
    "updatedBy": "tmvxt59c3gvssv",
-   "deleted": false,
-   "_ts": "2026-11-01T12:30:37.790Z"
+   "deleted": true,
+   "_ts": "2026-11-01T12:45:08.028Z",
+   "deletedBy": "tmvxt59c3gvssv",
+   "deletedAt": "2026-11-01T12:45:08.028Z"
   }
  ],
  "meta": {},
