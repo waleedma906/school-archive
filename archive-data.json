@@ -1,8 +1,31 @@
 {
  "format": "school-archive-data",
  "version": 1,
- "updatedAt": "",
- "evidence": [],
+ "updatedAt": "2026-11-01T12:35:11.923Z",
+ "evidence": [
+  {
+   "id": "emvxt621qd9ryc",
+   "title": "اليوم الوطني",
+   "url": "https://estboys-my.sharepoint.com/:w:/g/personal/t9870630_estb_moe_gov_sa/IQBGQNz8Vci3Q64824vw5iRdAWv9kN_c6xbGJ5KC3xpQ5Xk?e=FdgEIi",
+   "note": "اليوم الوطني",
+   "year": "1448",
+   "activityIds": [
+    "ن01",
+    "ن02"
+   ],
+   "registerIds": [
+    "RS2-01"
+   ],
+   "createdBy": "tmvxt59c3gvssv",
+   "createdAt": "2026-11-01T12:30:37.790Z",
+   "updatedAt": "2026-11-01T12:30:37.790Z",
+   "updatedBy": "tmvxt59c3gvssv",
+   "deleted": false,
+   "_ts": "2026-11-01T12:30:37.790Z"
+  }
+ ],
  "meta": {},
- "people": {}
+ "people": {
+  "tmvxt59c3gvssv": "أ.وليد العازمي"
+ }
 }
